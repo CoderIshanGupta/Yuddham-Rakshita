@@ -40,3 +40,5 @@ class FullConfig:
     active_profile: str
     apps: Dict[str, AppInfo]               # key: exe_path
     profiles: Dict[str, ProfileConfig]     # key: profile name
+
+  
