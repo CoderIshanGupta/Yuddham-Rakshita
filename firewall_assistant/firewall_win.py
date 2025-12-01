@@ -1,10 +1,12 @@
+# firewall_assistant/firewall_win.py
+
 from __future__ import annotations
 
 import argparse
 import ctypes
 import subprocess
 from pathlib import Path
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 Direction = Literal["in", "out", "both"]
 
@@ -167,6 +169,32 @@ def status_app(path: str) -> None:
 
     if not found_any:
         print("[INFO] No FWAssist_* rules found for this app.")
+
+
+# ---------------------------------------------------------------------------
+# Profile sync stub (Week 1)
+# ---------------------------------------------------------------------------
+
+def sync_profile_to_windows_firewall(
+    profile_name: str,
+    cfg_path: Optional[str] = None,
+) -> None:
+    """
+    Week 1 stub.
+
+    In later weeks, this will:
+      - Load config (or use cfg_path)
+      - Look at the profile's app_rules
+      - Call block_app/allow_app as needed to enforce the profile.
+
+    For now, it's a no-op (just prints) so that profiles.apply_profile()
+    works without breaking imports.
+    """
+    msg = f"[stub] sync_profile_to_windows_firewall('{profile_name}'"
+    if cfg_path is not None:
+        msg += f", cfg_path='{cfg_path}'"
+    msg += ") – not implemented yet"
+    print(msg)
 
 
 # ---------------------------------------------------------------------------
