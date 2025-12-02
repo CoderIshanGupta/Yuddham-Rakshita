@@ -1,13 +1,17 @@
 # main.py
 
 """
-Entry point placeholder.
+Entry point for the Firewall Assistant GUI.
 
-Week 1:
-  - Use the CLI in firewall_assistant.firewall_win instead:
-      python -m firewall_assistant.firewall_win --help
+Run:
+    python main.py
+
+Note:
+    For firewall operations to succeed, run your terminal as
+    "Run as administrator" on Windows.
 """
 
+from firewall_assistant.ui.main_window import run
+
 if __name__ == "__main__":
-    print("Week 1: main.py is a placeholder.")
-    print("Use: python -m firewall_assistant.firewall_win --help")
+    run()
