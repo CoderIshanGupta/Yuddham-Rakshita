@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict
+import datetime as _dt
 
 from .models import FullConfig, ProfileConfig, Action, AppRule
 from .config import load_config, save_config
@@ -104,7 +105,8 @@ def set_app_action_in_profile(
         change_type = "created"
     else:
         rule.action = action
-        rule.temporary_until = None  # clear temporary when user sets explicitly
+        # When user explicitly sets rule, clear any previous temporary allowance
+        rule.temporary_until = None
         change_type = "updated"
 
     log_event(
@@ -120,6 +122,55 @@ def set_app_action_in_profile(
 
 
 # ---------------------------------------------------------------------------
+# Temporary allow helper ("Why is this app not working?")
+# ---------------------------------------------------------------------------
+
+def set_temporary_allow_in_active_profile(
+    exe_path: str,
+    minutes: int = 60,
+) -> None:
+    """
+    Mark a BLOCK rule for this app in the ACTIVE profile as temporarily allowed
+    for 'minutes' minutes.
+
+    Semantics:
+      - The underlying rule.action remains "block".
+      - temporary_until is set to now + minutes.
+      - sync_profile_to_windows_firewall() treats this as ALLOW until expiry.
+      - After expiry (next sync), it behaves as a normal block again.
+    """
+    cfg = load_config()
+    profile = get_active_profile(cfg)
+    exe_path_resolved = str(Path(exe_path).resolve())
+
+    rule = profile.app_rules.get(exe_path_resolved)
+    if rule is None or rule.action != "block":
+        raise ValueError(
+            f"App '{exe_path_resolved}' is not currently BLOCKED in active profile "
+            f"'{profile.name}', so temporary allow does not apply."
+        )
+
+    until_dt = _dt.datetime.utcnow() + _dt.timedelta(minutes=minutes)
+    until_str = until_dt.isoformat(timespec="seconds")
+    rule.temporary_until = until_str
+    save_config(cfg)
+
+    log_event(
+        "APP_TEMP_ALLOW_SET",
+        f"Temporarily allowing {exe_path_resolved} in profile '{profile.name}'",
+        {
+            "profile": profile.name,
+            "exe_path": exe_path_resolved,
+            "temporary_until": until_str,
+            "duration_minutes": minutes,
+        },
+    )
+
+    # Re-apply profile so firewall immediately unblocks this app.
+    sync_profile_to_windows_firewall(profile.name)
+
+
+# ---------------------------------------------------------------------------
 # "Why is this app not working?" backend helper
 # ---------------------------------------------------------------------------
 
@@ -131,34 +182,59 @@ def explain_app_in_active_profile(exe_path: str) -> Dict[str, Any]:
       - exe_path
       - profile
       - profile_display_name
-      - action           ("allow" or "block")
+      - action           (effective: "allow" or "block", considering temporary_until)
       - direction        ("in", "out", "both") – if explicit rule, else "out"
-      - temporary_until  (str or None)
+      - temporary_until  (str or None, from the rule if any)
       - reason           (human-readable explanation)
-
-    This is meant to be used by the UI when the user asks:
-      "Why is this app not working?"
     """
     cfg = load_config()
     profile = get_active_profile(cfg)
     exe_path_resolved = str(Path(exe_path).resolve())
+    now = _dt.datetime.utcnow()
 
     explicit_rule = profile.app_rules.get(exe_path_resolved)
 
     if explicit_rule:
-        explanation = {
+        effective_action: Action = explicit_rule.action
+        direction = explicit_rule.direction
+        temporary_until = explicit_rule.temporary_until
+        temp_active = False
+
+        # If there's a temporary_until on a BLOCK rule, and it's still in the future,
+        # treat this as effectively ALLOW for now.
+        if temporary_until and explicit_rule.action == "block":
+            try:
+                expiry = _dt.datetime.fromisoformat(temporary_until)
+                if now < expiry:
+                    effective_action = "allow"
+                    temp_active = True
+            except ValueError:
+                # Ignore malformed timestamps; treat as normal block/allow
+                pass
+
+        if temp_active:
+            reason = (
+                f"This app would normally be BLOCKED by profile "
+                f"'{profile.display_name}', but it is TEMPORARILY ALLOWED "
+                f"until {temporary_until}."
+            )
+        else:
+            reason = (
+                f"Explicit rule in profile '{profile.display_name}': "
+                f"{explicit_rule.action.upper()} ({explicit_rule.direction})"
+            )
+
+        explanation: Dict[str, Any] = {
             "exe_path": exe_path_resolved,
             "profile": profile.name,
             "profile_display_name": profile.display_name,
-            "action": explicit_rule.action,
-            "direction": explicit_rule.direction,
-            "temporary_until": explicit_rule.temporary_until,
-            "reason": (
-                f"Explicit rule in profile '{profile.display_name}': "
-                f"{explicit_rule.action.upper()} ({explicit_rule.direction})"
-            ),
+            "action": effective_action,
+            "direction": direction,
+            "temporary_until": temporary_until,
+            "reason": reason,
         }
     else:
+        # No explicit rule: fall back to default_action
         explanation = {
             "exe_path": exe_path_resolved,
             "profile": profile.name,
@@ -203,6 +279,11 @@ if __name__ == "__main__":
         metavar="EXE_PATH",
         help="Explain how the active profile treats this executable.",
     )
+    parser.add_argument(
+        "--temp-allow",
+        metavar="EXE_PATH",
+        help="Temporarily allow this executable for 60 minutes in the active profile.",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -219,3 +300,7 @@ if __name__ == "__main__":
         print("\nExplanation:")
         for k, v in info.items():
             print(f"  {k}: {v}")
+
+    if args.temp_allow:
+        set_temporary_allow_in_active_profile(args.temp_allow, minutes=60)
+        print(f"\nTemporary allow set for {args.temp_allow} in active profile.")
