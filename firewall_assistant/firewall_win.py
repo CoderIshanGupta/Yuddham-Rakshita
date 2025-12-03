@@ -7,8 +7,9 @@ import ctypes
 import subprocess
 from pathlib import Path
 from typing import List, Literal, Optional
+import datetime as _dt
 
-from .activity_log import log_event  # NEW: logging integration
+from .activity_log import log_event
 
 Direction = Literal["in", "out", "both"]
 
@@ -264,7 +265,7 @@ def status_app(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Profile sync (Week 2/3 – real implementation + logging)
+# Profile sync – aware of temporary_until
 # ---------------------------------------------------------------------------
 
 def sync_profile_to_windows_firewall(
@@ -279,10 +280,13 @@ def sync_profile_to_windows_firewall(
       2) Clear all existing FWAssist_* rules
       3) For the selected profile:
            - For each app rule:
-               * if action == "block": create a block rule (respecting direction)
+               * if action == "block": create a block rule (respecting direction),
+                 UNLESS there is an active temporary_until, in which case allow.
                * if action == "allow": remove any FWAssist_* rules for that app
+      4) If any temporary_until timestamps have expired or are invalid,
+         clear them in config.
     """
-    from .config import load_config
+    from .config import load_config, save_config
 
     cfg = load_config()
 
@@ -302,11 +306,34 @@ def sync_profile_to_windows_firewall(
     _clear_all_fwassist_rules()
 
     # 2) Apply rules for this profile
+    now = _dt.datetime.utcnow()
+    cfg_modified = False
+
     for exe_path, rule in profile.app_rules.items():
         exe_path_resolved = str(Path(exe_path).resolve())
+        dir_value: Direction = rule.direction  # config parsing normalizes this
 
-        if rule.action == "block":
-            dir_value: Direction = rule.direction  # type-ignored; we sanitize in config
+        # Determine effective action, considering temporary_until on block rules
+        effective_action = rule.action
+        temp_active = False
+
+        if rule.temporary_until and rule.action == "block":
+            try:
+                expiry = _dt.datetime.fromisoformat(rule.temporary_until)
+                if now < expiry:
+                    # Temporarily allow: skip creating block rule
+                    effective_action = "allow"
+                    temp_active = True
+                else:
+                    # Temporary has expired; clear it
+                    rule.temporary_until = None
+                    cfg_modified = True
+            except ValueError:
+                # Invalid timestamp; clear it to avoid confusion
+                rule.temporary_until = None
+                cfg_modified = True
+
+        if effective_action == "block":
             block_app(exe_path_resolved, direction=dir_value)
             log_event(
                 "PROFILE_RULE_APPLIED",
@@ -316,22 +343,35 @@ def sync_profile_to_windows_firewall(
                     "exe_path": exe_path_resolved,
                     "action": "block",
                     "direction": dir_value,
+                    "temporary_until": rule.temporary_until,
                 },
             )
-        elif rule.action == "allow":
+        elif effective_action == "allow":
+            # This is either an explicit allow rule, or a temporary allow
             allow_app(exe_path_resolved)
-            log_event(
-                "PROFILE_RULE_APPLIED",
-                f"Profile '{profile_name}' allowing {exe_path_resolved}",
-                {
-                    "profile": profile_name,
-                    "exe_path": exe_path_resolved,
-                    "action": "allow",
-                },
-            )
+            event_type = "PROFILE_RULE_APPLIED"
+            message = f"Profile '{profile_name}' allowing {exe_path_resolved}"
+            extra: dict = {
+                "profile": profile_name,
+                "exe_path": exe_path_resolved,
+                "action": "allow",
+                "base_action": rule.action,
+                "temporary_until": rule.temporary_until,
+            }
+            if temp_active:
+                event_type = "PROFILE_RULE_TEMP_ALLOW_IN_EFFECT"
+                message = (
+                    f"Profile '{profile_name}' TEMPORARILY ALLOWING "
+                    f"{exe_path_resolved} until {rule.temporary_until}"
+                )
+            log_event(event_type, message, extra)
         else:
-            # Should not happen because Action is Literal["allow","block"]
+            # Should not happen (Action is Literal["allow","block"])
             continue
+
+    # Save config if we modified any temporary_until (expired / invalid)
+    if cfg_modified:
+        save_config(cfg)
 
     print(f"[INFO] Profile '{profile_name}' sync complete.")
     log_event(
@@ -348,7 +388,7 @@ def sync_profile_to_windows_firewall(
 def _cli() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Week 1/2/3 – Windows Firewall control per application (FWAssist).\n"
+            "Windows Firewall control per application (FWAssist).\n"
             "Run this as Administrator."
         )
     )
