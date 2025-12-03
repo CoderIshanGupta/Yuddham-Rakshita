@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "active_profile": "focus",
+  "active_profile": "normal",
   "apps": {
     "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe": {
       "name": "Google Chrome",
@@ -52,12 +52,12 @@
         "C:\\Games\\CoolGame\\game.exe": {
           "action": "block",
           "direction": "out",
-          "temporary_until": "2025-01-01T16:00:00"
+          "temporary_until": null
         },
         "C:\\Windows\\System32\\notepad.exe": {
           "action": "block",
           "direction": "out",
-          "temporary_until": null
+          "temporary_until": "2025-12-03T15:22:41"
         }
       }
     }

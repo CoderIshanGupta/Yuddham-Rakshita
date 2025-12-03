@@ -259,48 +259,115 @@ def explain_app_in_active_profile(exe_path: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Simple CLI for debug / manual testing
+# Helper for CLI: list rules for a profile
+# ---------------------------------------------------------------------------
+
+def _list_rules_for_profile(profile_name: str) -> None:
+    """
+    Print the rules (and effective status) for the given profile to stdout.
+    Intended only for the __main__ CLI.
+    """
+    cfg = load_config()
+    if profile_name not in cfg.profiles:
+        print(f"Profile '{profile_name}' not found.")
+        return
+
+    profile = cfg.profiles[profile_name]
+    now = _dt.datetime.utcnow()
+
+    print(f"Profile: {profile.display_name} ({profile.name})")
+    print(f"default_action = {profile.default_action}")
+    print("Rules:")
+
+    if not profile.app_rules:
+        print("  (no explicit app rules)")
+        return
+
+    for exe_path, rule in profile.app_rules.items():
+        eff_action: Action = rule.action
+        temp_note = ""
+        if rule.temporary_until and rule.action == "block":
+            try:
+                expiry = _dt.datetime.fromisoformat(rule.temporary_until)
+                if now < expiry:
+                    eff_action = "allow"
+                    temp_note = f" (TEMP ALLOW until {rule.temporary_until})"
+            except ValueError:
+                pass
+
+        print(f"  {exe_path}")
+        print(f"    base_action   = {rule.action}")
+        print(f"    direction     = {rule.direction}")
+        print(f"    effective_act = {eff_action}{temp_note}")
+        print(f"    temporary_until = {rule.temporary_until}")
+
+
+# ---------------------------------------------------------------------------
+# CLI for debug / manual testing (Week 4 backend tooling)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Profile management / explanation test CLI (Member 1, Week 3)."
+        description="Profile management / explanation CLI for Firewall Assistant."
     )
-    parser.add_argument(
-        "profile",
-        nargs="?",
-        help="Profile name to apply (e.g. normal, public_wifi, focus). "
-             "If omitted, no profile is changed.",
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # apply PROFILE
+    p_apply = subparsers.add_parser(
+        "apply",
+        help="Set active profile and sync Windows Firewall.",
     )
-    parser.add_argument(
-        "--explain",
-        metavar="EXE_PATH",
-        help="Explain how the active profile treats this executable.",
+    p_apply.add_argument("profile", help="Profile name (e.g. normal, public_wifi, focus)")
+
+    # explain EXE_PATH
+    p_explain = subparsers.add_parser(
+        "explain",
+        help="Explain how the ACTIVE profile treats this executable.",
     )
-    parser.add_argument(
-        "--temp-allow",
-        metavar="EXE_PATH",
-        help="Temporarily allow this executable for 60 minutes in the active profile.",
+    p_explain.add_argument("exe_path", help="Path to executable to explain")
+
+    # temp-allow EXE_PATH [--minutes N]
+    p_temp = subparsers.add_parser(
+        "temp-allow",
+        help="Temporarily allow a BLOCKED app in the ACTIVE profile.",
     )
+    p_temp.add_argument("exe_path", help="Path to executable to temp-allow")
+    p_temp.add_argument(
+        "--minutes",
+        type=int,
+        default=60,
+        help="Duration in minutes (default: 60)",
+    )
+
+    # list-rules PROFILE
+    p_list = subparsers.add_parser(
+        "list-rules",
+        help="List all rules defined in a profile.",
+    )
+    p_list.add_argument("profile", help="Profile name")
+
     args = parser.parse_args()
 
-    cfg = load_config()
-    print("Existing profiles:", ", ".join(cfg.profiles.keys()))
-    print("Active profile before:", cfg.active_profile)
-
-    if args.profile:
+    if args.command == "apply":
+        print("Existing profiles:", ", ".join(load_config().profiles.keys()))
         apply_profile(args.profile)
         cfg2 = load_config()
-        print("Active profile after:", cfg2.active_profile)
+        print("Active profile is now:", cfg2.active_profile)
 
-    if args.explain:
-        info = explain_app_in_active_profile(args.explain)
-        print("\nExplanation:")
+    elif args.command == "explain":
+        info = explain_app_in_active_profile(args.exe_path)
+        print("Explanation:")
         for k, v in info.items():
             print(f"  {k}: {v}")
 
-    if args.temp_allow:
-        set_temporary_allow_in_active_profile(args.temp_allow, minutes=60)
-        print(f"\nTemporary allow set for {args.temp_allow} in active profile.")
+    elif args.command == "temp-allow":
+        try:
+            set_temporary_allow_in_active_profile(args.exe_path, minutes=args.minutes)
+            print(f"Temporary allow set for {args.exe_path} in active profile for {args.minutes} minutes.")
+        except Exception as exc:
+            print(f"Error setting temporary allow: {exc}")
+
+    elif args.command == "list-rules":
+        _list_rules_for_profile(args.profile)
