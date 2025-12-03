@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from typing import List
+from typing import List, Optional
 import datetime as _dt
 
 from ..config import load_config, save_config
@@ -18,6 +18,7 @@ from ..profiles import (
 from ..discovery import merge_discovered_apps_into_config
 from ..activity_log import get_recent_events, log_event
 from ..models import FullConfig, AppInfo
+from ..firewall_win import is_admin  # for admin status indicator
 
 
 class MainWindow(tk.Tk):
@@ -31,11 +32,19 @@ class MainWindow(tk.Tk):
         self.cfg: FullConfig = load_config()
         self.current_profile_name: str = self.cfg.active_profile
 
+        # Track last time "Refresh Apps" was called (for status bar)
+        self.last_apps_refresh: Optional[str] = None
+
+        # Check admin status once
+        self.is_admin: bool = is_admin()
+
         # Top-level layout frames
         self._build_layout()
         self._populate_profiles()
         self.refresh_apps_table()
         self.refresh_logs()
+        self._update_admin_status_label()
+        self._update_status_bar()
 
     # ------------------------------------------------------------------
     # Layout / UI construction
@@ -43,9 +52,10 @@ class MainWindow(tk.Tk):
 
     def _build_layout(self) -> None:
         """Create all main frames and widgets."""
-        # Root: use a vertical layout: profiles at top, then main content
+        # Root: vertical layout: profiles at top, main content, then status bar
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(1, weight=1)  # main_frame expands
+        self.rowconfigure(2, weight=0)  # status bar
 
         # Profile bar at top
         self.profile_frame = ttk.Frame(self, padding=(10, 5))
@@ -57,6 +67,10 @@ class MainWindow(tk.Tk):
 
         self.active_profile_label = ttk.Label(self.profile_frame, text="")
         self.active_profile_label.grid(row=0, column=1, sticky="e", padx=(20, 0))
+
+        # Admin status label (second row in profile frame)
+        self.admin_status_label = ttk.Label(self.profile_frame, text="")
+        self.admin_status_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         # Main content: split into left (apps) and right (logs)
         self.main_frame = ttk.Frame(self, padding=10)
@@ -80,6 +94,10 @@ class MainWindow(tk.Tk):
         self.logs_frame.columnconfigure(0, weight=1)
 
         self._build_logs_panel()
+
+        # Status bar at the bottom
+        self.status_bar = ttk.Label(self, text="", anchor="w", padding=(10, 2))
+        self.status_bar.grid(row=2, column=0, sticky="ew")
 
     def _build_apps_panel(self) -> None:
         """Create the apps Treeview and its buttons."""
@@ -106,6 +124,9 @@ class MainWindow(tk.Tk):
         self.apps_tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
+
+        # Update buttons when selection changes
+        self.apps_tree.bind("<<TreeviewSelect>>", lambda e: self._update_buttons_state())
 
         # Buttons under the tree
         btn_frame = ttk.Frame(self.apps_frame)
@@ -147,6 +168,9 @@ class MainWindow(tk.Tk):
             command=self.temp_allow_selected_app,
         )
         self.temp_allow_button.grid(row=0, column=4, sticky="ew", padx=2)
+
+        # Initial button states (no selection yet)
+        self._update_buttons_state()
 
     def _build_logs_panel(self) -> None:
         """Create the logs listbox and refresh button."""
@@ -209,6 +233,19 @@ class MainWindow(tk.Tk):
                 text=f"Active profile: {self.current_profile_name}"
             )
 
+    def _update_admin_status_label(self) -> None:
+        """Show if we are running as Administrator or not."""
+        if self.is_admin:
+            self.admin_status_label.config(
+                text="Running as Administrator – firewall changes should work.",
+                foreground="green",
+            )
+        else:
+            self.admin_status_label.config(
+                text="Not running as Administrator – firewall changes may FAIL.",
+                foreground="red",
+            )
+
     def on_profile_selected(self, profile_name: str) -> None:
         """
         Called when user clicks a profile button.
@@ -222,6 +259,7 @@ class MainWindow(tk.Tk):
             self.profile_var.set(self.current_profile_name)
             self._update_active_profile_label()
             self.refresh_apps_table()
+            self._update_status_bar()
 
             log_event(
                 "PROFILE_APPLIED",
@@ -247,6 +285,10 @@ class MainWindow(tk.Tk):
         merge_discovered_apps_into_config(self.cfg)
         save_config(self.cfg)
         self.refresh_apps_table()
+
+        # Record last refresh time for status bar
+        self.last_apps_refresh = _dt.datetime.now().strftime("%H:%M:%S")
+        self._update_status_bar()
 
         log_event("APPS_REFRESHED", "Discovered and merged active apps", {})
 
@@ -275,8 +317,7 @@ class MainWindow(tk.Tk):
         for app in apps_list:
             exe_path = app.exe_path
             rule = profile.app_rules.get(exe_path)
-            status = profile.default_action
-            status_display = status.upper()
+            status_display: str
 
             if rule is not None:
                 status = rule.action
@@ -304,6 +345,10 @@ class MainWindow(tk.Tk):
                 "end",
                 values=(app.name, exe_path, status_display),
             )
+
+        # After repopulating, no app is selected by default
+        self._update_buttons_state()
+        self._update_status_bar()
 
     def _change_selected_apps_action(self, action: str) -> None:
         """
@@ -362,6 +407,49 @@ class MainWindow(tk.Tk):
     def block_selected_apps(self) -> None:
         """Block selected apps (for current profile)."""
         self._change_selected_apps_action("block")
+
+    # ------------------------------------------------------------------
+    # Button state + status bar
+    # ------------------------------------------------------------------
+
+    def _update_buttons_state(self) -> None:
+        """
+        Enable/disable buttons based on current selection in the apps tree.
+        - Allow/Block: enabled if ≥1 app selected.
+        - Why not working? / Temp Allow 1h: enabled if exactly 1 app selected.
+        """
+        selected = self.apps_tree.selection()
+        count = len(selected)
+
+        has_any = count >= 1
+        single = count == 1
+
+        # Helper to set button state
+        def set_btn_state(btn: ttk.Button, enabled: bool) -> None:
+            if enabled:
+                btn.state(["!disabled"])
+            else:
+                btn.state(["disabled"])
+
+        set_btn_state(self.allow_button, has_any)
+        set_btn_state(self.block_button, has_any)
+        set_btn_state(self.explain_button, single)
+        set_btn_state(self.temp_allow_button, single)
+
+    def _update_status_bar(self) -> None:
+        """
+        Update the status bar with active profile, number of apps, and last refresh time.
+        """
+        active_profile = self.current_profile_name
+        apps_count = len(self.cfg.apps)
+        last_refresh = self.last_apps_refresh or "n/a"
+
+        text = (
+            f"Profile: {active_profile} | "
+            f"Apps listed: {apps_count} | "
+            f"Last Refresh Apps: {last_refresh}"
+        )
+        self.status_bar.config(text=text)
 
     # ------------------------------------------------------------------
     # "Why not working?" + temporary allow
