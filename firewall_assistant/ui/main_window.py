@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from typing import List
+import datetime as _dt
 
 from ..config import load_config, save_config
-from ..profiles import apply_profile, set_app_action_in_profile, get_active_profile
+from ..profiles import (
+    apply_profile,
+    set_app_action_in_profile,
+    get_active_profile,
+    explain_app_in_active_profile,
+    set_temporary_allow_in_active_profile,
+)
 from ..discovery import merge_discovered_apps_into_config
 from ..activity_log import get_recent_events, log_event
 from ..models import FullConfig, AppInfo
@@ -90,7 +97,7 @@ class MainWindow(tk.Tk):
 
         self.apps_tree.column("name", width=160, anchor="w")
         self.apps_tree.column("exe_path", width=420, anchor="w")
-        self.apps_tree.column("status", width=140, anchor="center")
+        self.apps_tree.column("status", width=180, anchor="center")
 
         vsb = ttk.Scrollbar(self.apps_frame, orient="vertical", command=self.apps_tree.yview)
         hsb = ttk.Scrollbar(self.apps_frame, orient="horizontal", command=self.apps_tree.xview)
@@ -103,9 +110,8 @@ class MainWindow(tk.Tk):
         # Buttons under the tree
         btn_frame = ttk.Frame(self.apps_frame)
         btn_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(5, 0))
-        btn_frame.columnconfigure(0, weight=1)
-        btn_frame.columnconfigure(1, weight=1)
-        btn_frame.columnconfigure(2, weight=1)
+        for col in range(5):
+            btn_frame.columnconfigure(col, weight=1)
 
         self.refresh_apps_button = ttk.Button(
             btn_frame,
@@ -127,6 +133,20 @@ class MainWindow(tk.Tk):
             command=self.block_selected_apps,
         )
         self.block_button.grid(row=0, column=2, sticky="ew", padx=2)
+
+        self.explain_button = ttk.Button(
+            btn_frame,
+            text="Why not working?",
+            command=self.explain_selected_app,
+        )
+        self.explain_button.grid(row=0, column=3, sticky="ew", padx=2)
+
+        self.temp_allow_button = ttk.Button(
+            btn_frame,
+            text="Temp Allow 1h",
+            command=self.temp_allow_selected_app,
+        )
+        self.temp_allow_button.grid(row=0, column=4, sticky="ew", padx=2)
 
     def _build_logs_panel(self) -> None:
         """Create the logs listbox and refresh button."""
@@ -244,8 +264,9 @@ class MainWindow(tk.Tk):
             # Fallback: try to restore active profile
             profile = get_active_profile(self.cfg)
 
+        now = _dt.datetime.utcnow()
+
         # Build rows
-        # Sort by app name for nicer view
         apps_list: List[AppInfo] = sorted(
             self.cfg.apps.values(),
             key=lambda a: (a.name.lower(), a.exe_path.lower()),
@@ -254,16 +275,34 @@ class MainWindow(tk.Tk):
         for app in apps_list:
             exe_path = app.exe_path
             rule = profile.app_rules.get(exe_path)
+            status = profile.default_action
+            status_display = status.upper()
+
             if rule is not None:
-                status = rule.action  # "allow" or "block"
+                status = rule.action
+                temp_active = False
+
+                if rule.temporary_until and rule.action == "block":
+                    try:
+                        expiry = _dt.datetime.fromisoformat(rule.temporary_until)
+                        if now < expiry:
+                            # Temporarily allowed
+                            temp_active = True
+                    except ValueError:
+                        pass
+
+                if temp_active:
+                    status_display = "ALLOW (TEMP)"
+                else:
+                    status_display = status.upper()
             else:
-                # For now, unknown apps follow default_action in UI only.
-                status = profile.default_action
+                # No explicit rule; use default_action
+                status_display = profile.default_action.upper()
 
             self.apps_tree.insert(
                 "",
                 "end",
-                values=(app.name, exe_path, status.upper()),
+                values=(app.name, exe_path, status_display),
             )
 
     def _change_selected_apps_action(self, action: str) -> None:
@@ -323,6 +362,99 @@ class MainWindow(tk.Tk):
     def block_selected_apps(self) -> None:
         """Block selected apps (for current profile)."""
         self._change_selected_apps_action("block")
+
+    # ------------------------------------------------------------------
+    # "Why not working?" + temporary allow
+    # ------------------------------------------------------------------
+
+    def _get_single_selected_exe_path(self) -> str | None:
+        selected = self.apps_tree.selection()
+        if len(selected) != 1:
+            messagebox.showinfo(
+                "Select an app",
+                "Please select exactly one application in the list.",
+            )
+            return None
+
+        values = self.apps_tree.item(selected[0], "values")
+        if len(values) < 2:
+            return None
+        return values[1]
+
+    def explain_selected_app(self) -> None:
+        exe_path = self._get_single_selected_exe_path()
+        if not exe_path:
+            return
+
+        try:
+            info = explain_app_in_active_profile(exe_path)
+        except Exception as exc:
+            print(f"[UI] Failed to explain app '{exe_path}': {exc}")
+            messagebox.showerror(
+                "Error",
+                f"Could not determine why this app is not working:\n{exc}",
+            )
+            return
+
+        action = info.get("action", "")
+        direction = info.get("direction", "")
+        profile_name = info.get("profile", "")
+        profile_display = info.get("profile_display_name", profile_name)
+        temporary_until = info.get("temporary_until")
+        reason = info.get("reason", "")
+
+        msg_lines = [
+            f"Profile: {profile_display} ({profile_name})",
+            f"Effective action: {action.upper()} ({direction})",
+        ]
+        if temporary_until:
+            msg_lines.append(f"Temporary until: {temporary_until}")
+        msg_lines.append("")
+        msg_lines.append("Reason:")
+        msg_lines.append(reason)
+
+        messagebox.showinfo(
+            "App network status",
+            "\n".join(msg_lines),
+        )
+
+    def temp_allow_selected_app(self) -> None:
+        exe_path = self._get_single_selected_exe_path()
+        if not exe_path:
+            return
+
+        # Confirm with the user
+        if messagebox.askyesno(
+            "Temporarily allow for 1 hour",
+            "This will temporarily ALLOW this app's internet access "
+            "for 1 hour in the current profile.\n\n"
+            "After that, it will be blocked again when the profile is re-applied.\n\n"
+            "Continue?",
+        ):
+            try:
+                set_temporary_allow_in_active_profile(exe_path, minutes=60)
+            except ValueError as exc:
+                messagebox.showinfo(
+                    "Cannot temporarily allow",
+                    str(exc),
+                )
+                return
+            except Exception as exc:
+                print(f"[UI] Failed to set temporary allow for '{exe_path}': {exc}")
+                messagebox.showerror(
+                    "Error",
+                    f"Failed to set temporary allow:\n{exc}",
+                )
+                return
+
+            # Refresh view to show ALLOW (TEMP)
+            self.cfg = load_config()
+            self.refresh_apps_table()
+
+            messagebox.showinfo(
+                "Temporary allow set",
+                "This app is now temporarily allowed for 1 hour in the active profile.",
+            )
 
     # ------------------------------------------------------------------
     # Logs handling
